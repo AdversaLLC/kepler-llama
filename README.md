@@ -43,6 +43,12 @@ How it was checked: `test-backend-ops test -o MUL_MAT -p "type_a=q4_K,type_b=f32
 pass against the CPU reference; perplexity on wikitext-2 (Jamba-3B, 8 chunks) is 9.863 on the K6000 with the kernel, 9.864 on an A2 and 9.853
 on the CPU (all within noise). Greedy text can differ in wording from older runs because the activations are no longer rounded to int8.
 
+Measured dead ends (so nobody repeats them): software-prefetching the next block's weights made the kernel slower (651 us vs 489 us; the extra
+registers cut occupancy); forcing higher occupancy with `__launch_bounds__(128, 10/12/16)` forced register spills and was 3-8x slower
+(1,585 / 2,448 / 3,722 us). Sharing activation loads across rows (the "y re-reads dominate" hypothesis) gave nothing. A Q6_K kernel is not worth
+writing for these models: Q6_K is only 2.7% (Mamba-Codestral) to 5.2% (Falcon-Mamba) of the bytes read per token, while Q4_K is 93-97%. What is left
+is the Q4_K kernel itself, at ~67 GB/s of the 288 GB/s peak: it is instruction-issue bound (the card draws only 60-95 W of 225 W).
+
 Limits: only **Q4_K**, only **decode** (one token), unfused ops (fusion is already off for cc <= Pascal); Q6_K and the other quantizations, and
 prompt processing, still use the slow path (prompt speed is unchanged). Maxwell (cc 5.x) should benefit but is untested. Running the full
 `test-backend-ops` suite on Kepler aborts on a bf16 case (cuBLAS cannot do bf16 there), so filter by type as above.
