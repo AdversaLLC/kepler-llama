@@ -17,12 +17,29 @@ Tested on: Quadro K6000 (compute 3.5, 12 GB) + 2x NVIDIA A2 (compute 8.6, 15 GB)
 | AI21-Jamba-Reasoning-3B | K6000 | 163 | 16.0 |
 | Falcon-Mamba-7B-Instruct | K6000 | 86.8 | 7.5 |
 | Falcon-Mamba-7B-Instruct | A2 | 494.9 | 23.8 |
-| **AI21-Jamba-Mini-1.7 (51.6B, 29 GiB)** | **2x A2 + K6000** (`-ts 15/15/12`) | 51.5 | 9.9 |
+| **AI21-Jamba-Mini-1.7 (51.6B, 29 GiB)** | **2x A2 + K6000** (`-ts 15/15/12`, memory-proportional) | 51.5 | 9.9 |
+| **AI21-Jamba-Mini-1.7, tuned split** | **2x A2 + K6000** (`-ts 20/20/8`) | **93.3** | **12.8** |
 
 Output on the 3-card run was coherent and correct. On Jamba-3B the greedy text is identical on the K6000 and the CPU.
 On Mamba-130M the first generated word differs from the CPU, while perplexity agrees (1.094 vs 1.101); I believe that is a
 near-tied first token, but I have not proven it. Generation on the K6000 is far below its memory-bandwidth limit, so the SSM
 kernels have room for tuning. Flash attention is off (`GGML_CUDA_FA=OFF`); no tests of other model families were run.
+
+## Tuning the split across unequal cards
+Splitting layers in proportion to VRAM (`-ts 15/15/12`) is not the fastest: the slow card then sets the pace. Same model, `llama-bench -p 128 -n 32`:
+
+| `-ts` (A2 / A2 / K6000) | prompt tok/s | generate tok/s |
+|---|---|---|
+| 15/15/12 (by memory) | 71.0 | 10.0 |
+| 18/18/12 | 72.5 | 10.7 |
+| 20/20/10 | 82.3 | 11.8 |
+| **20/20/8** | **93.3** | **12.8** |
+| 21/21/6 | 95.0 | 12.9 (22/22/6 does not fit) |
+| 22/22/8 | 85.0 | 11.3 (noisy) |
+
+Less on the K6000 is better until the A2s run out of memory. Greedy output was identical to the 15/15/12 run. Failure mode to know: when a card's
+VRAM is exhausted the error is `CUBLAS_STATUS_NOT_INITIALIZED`, not "out of memory". Note `llama-bench` takes `-ts 20/20/8` (slashes) while
+`llama-cli`/`llama-server` take `-ts 20,20,8` (commas); a comma in `llama-bench` is silently misread and puts everything on GPU 0.
 
 ## What is in here
 
@@ -51,7 +68,7 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && git checkout 
 git am /path/to/patches/llama.cpp/*.patch
 /path/to/scripts/configure.sh . ~/kepler-tc/cudaroot "35;86"
 ninja -C build llama-server llama-bench llama-completion
-/path/to/scripts/serve.sh . ~/kepler-tc/cudaroot model.gguf 15,15,12     # GPUS=0,1,2 by default
+/path/to/scripts/serve.sh . ~/kepler-tc/cudaroot model.gguf 20,20,8     # GPUS=0,1,2 by default
 ```
 
 Use `35` alone for a Kepler-only build (faster). Check `nvidia-smi -L` for the device order before choosing `-ts`.
