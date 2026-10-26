@@ -1,0 +1,4 @@
+.venv/
+*.gguf
+*.part
+build/

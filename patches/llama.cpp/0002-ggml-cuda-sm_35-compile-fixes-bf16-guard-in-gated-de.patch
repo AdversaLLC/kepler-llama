@@ -1,0 +1,28 @@
+From 7e8f291e1e81a94c5f91b2e4b7189b9c986fc3f7 Mon Sep 17 00:00:00 2001
+From: kepler <kepler@local>
+Date: Mon, 26 Oct 2026 10:19:27 -0500
+Subject: [PATCH 2/3] ggml-cuda: sm_35 compile fixes (bf16 guard in
+ gated-delta-net-mma)
+
+---
+ ggml/src/ggml-cuda/gated-delta-net-mma.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/gated-delta-net-mma.cu b/ggml/src/ggml-cuda/gated-delta-net-mma.cu
+index 0684adc..d9c20b1 100644
+--- a/ggml/src/ggml-cuda/gated-delta-net-mma.cu
++++ b/ggml/src/ggml-cuda/gated-delta-net-mma.cu
+@@ -23,6 +23,10 @@ template <int R, int C> struct matrix {
+ #ifdef GGML_USE_MUSA
+         store(r, c, x.x);
+         store(r, c + 1, x.y);
++#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++        // bf16 conversions are unavailable below sm_80; this tensor-core path is never selected there
++        GGML_UNUSED(r); GGML_UNUSED(c); GGML_UNUSED(x);
++        __trap();
+ #else
+         const int    i                            = index(r, c);
+         const auto   h                            = __float22bfloat162_rn(x);
+-- 
+2.56.0
+

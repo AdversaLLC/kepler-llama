@@ -1,0 +1,16 @@
+--- a/nvidia-uvm/uvm.c
++++ b/nvidia-uvm/uvm.c
+@@ -814,13 +814,6 @@
+     // Using VM_DONTCOPY would be nice, but madvise(MADV_DOFORK) can reset that
+     // so we have to handle vm_open on fork anyway. We could disable MADV_DOFORK
+     // with VM_IO, but that causes other mapping issues.
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+-    // Rel. commit "mm: uninline the main body of vma_start_write()" (Suren Baghdasaryan, 13 Feb 2025)
+-    printk(KERN_WARNING "[NVIDIA] Unable to call vm_flags_(set|clear) on "
+-           "%s on Linux >=6.15, for more information see %s.\n", __func__,
+-           "https://gist.github.com/joanbm/def2bf57ed7a799c1d84a67606459314");
+-    return -ENOTSUPP;
+-#endif
+     nv_vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND);
+ 
+     vma->vm_ops = &uvm_vm_ops_managed;

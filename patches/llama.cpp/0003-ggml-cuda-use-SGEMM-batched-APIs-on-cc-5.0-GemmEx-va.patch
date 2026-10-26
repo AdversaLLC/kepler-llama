@@ -1,0 +1,51 @@
+From 2936d1a2c024098e1faed89057eec87e77f99ae2 Mon Sep 17 00:00:00 2001
+From: kepler <kepler@local>
+Date: Mon, 26 Oct 2026 10:27:59 -0500
+Subject: [PATCH 3/3] ggml-cuda: use SGEMM batched APIs on cc < 5.0 (GemmEx
+ variants need Maxwell+)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 454d17d..e01326d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1632,7 +1632,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+         const int64_t smb = ne12 == 1 ? s13 : s12;
+ 
+         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
+-        // use cublasGemmStridedBatchedEx
++        // use cublasGemmStridedBatchedEx (the *Ex variants need cc >= 5.0; Kepler uses the plain SGEMM API)
++        if (compute_type == GGML_TYPE_F32 && cu_data_type == CUDA_R_32F && cc < 500) {
++            CUBLAS_CHECK(
++            cublasSgemmStridedBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
++                    ne01, ne11, ne10,
++                    (const float *) alpha, (const float *) src0_ptr, s01, sma,
++                                           (const float *) src1_ptr, s11, smb,
++                    (const float *) beta,  (float       *)  dst_ptr, ldc, ne1*ldc,
++                    ne12*ne13));
++        } else
+         CUBLAS_CHECK(
+         cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                 ne01, ne11, ne10,
+@@ -1671,6 +1680,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+ 
+         CUDA_CHECK(cudaGetLastError());
+ 
++        if (compute_type == GGML_TYPE_F32 && cu_data_type == CUDA_R_32F && cc < 500) {
++            CUBLAS_CHECK(
++            cublasSgemmBatched(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
++                    ne01, ne11, ne10,
++                    (const float *) alpha, (const float **) (ptrs_src.get() + 0*ne23), s01,
++                                           (const float **) (ptrs_src.get() + 1*ne23), s11,
++                    (const float *) beta,  (      float **) (ptrs_dst.get() + 0*ne23), ldc,
++                    ne23));
++        } else
+         CUBLAS_CHECK(
+         cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                 ne01, ne11, ne10,
+-- 
+2.56.0
+
