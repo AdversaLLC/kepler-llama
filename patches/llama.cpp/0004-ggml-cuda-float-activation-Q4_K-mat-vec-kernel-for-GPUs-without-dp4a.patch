@@ -1,0 +1,212 @@
+From 28e54626408b148d7ecefcbcc487161d0dbfdb73 Mon Sep 17 00:00:00 2001
+From: kepler <kepler@local>
+Date: Mon, 26 Oct 2026 17:23:16 -0500
+Subject: [PATCH] ggml-cuda: float-activation Q4_K mat-vec kernel for GPUs
+ without dp4a (Kepler/Maxwell)
+
+On cc < 6.1 the generic mmvq path quantizes activations to int8 and emulates dp4a, reaching only ~35 GB/s on a K6000 (288 GB/s peak).
+For single-token decode (dense MUL_MAT, and MUL_MAT_ID with one token) use a kernel that keeps the activations in float and dequantizes
+each 4-bit weight with the magic-number trick (OR the nibble into the mantissa of 2^23, subtract 2^23). One lane owns a 16-byte chunk so
+the 6-bit scale decode is amortised over 32 weights; two rows per warp share each activation load; grid.y walks the selected experts.
+Fused and multi-column cases fall through to the existing path (fusion is already off for cc <= Pascal).
+
+K6000, MUL_MAT q4_K m=4096 k=14336 n=1: 946 us -> 489 us. Token generation on the K6000: Mamba-Codestral-7B 7.6 -> 12.9 tok/s,
+Falcon-Mamba-7B 7.5 -> 12.8, Jamba-Reasoning-3B 16.0 -> 22.1. Jamba-Mini 2xA2+K6000: 10.0 -> 14.5 with a tuned split.
+Checked with test-backend-ops (MUL_MAT q4_K n=1, MUL_MAT_ID q4_K) and perplexity (Jamba-3B wikitext: K6000 9.863, A2 9.864, CPU 9.853).
+---
+ ggml/src/ggml-cuda/mmvq-kepler.cu  | 125 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq-kepler.cuh |  12 +++
+ ggml/src/ggml-cuda/mmvq.cu         |  21 +++++
+ 3 files changed, 158 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/mmvq-kepler.cu
+ create mode 100644 ggml/src/ggml-cuda/mmvq-kepler.cuh
+
+diff --git a/ggml/src/ggml-cuda/mmvq-kepler.cu b/ggml/src/ggml-cuda/mmvq-kepler.cu
+new file mode 100644
+index 0000000..5b9f964
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-kepler.cu
+@@ -0,0 +1,125 @@
++#include "mmvq-kepler.cuh"
++
++// Why this exists: the generic path quantizes the activations to int8 and uses dp4a. Kepler has no dp4a and runs 32-bit integer
++// shifts and multiplies at 1/6 of the FP32 rate, so the emulation reaches only ~35 GB/s of the card's 288 GB/s. Here the activations
++// stay float and each 4-bit weight is converted with the "magic number" trick (OR the nibble into the mantissa of 2^23, subtract
++// 2^23), which uses only full-rate logic and FP32 operations.
++
++#define KEPLER_WARPS_PER_BLOCK 4
++#define KEPLER_ROWS_PER_WARP   2
++#define KEPLER_ROWS_PER_BLOCK  (KEPLER_WARPS_PER_BLOCK * KEPLER_ROWS_PER_WARP)
++
++static __device__ __forceinline__ float nibble_to_float(const uint32_t masked) {
++    // masked < 2^23, so the bit pattern 0x4B000000 | masked is exactly the float 2^23 + masked.
++    return __uint_as_float(0x4B000000u | masked) - 8388608.0f;
++}
++
++// 6-bit scale and min of sub-block j (0..7) from the 12 packed bytes, as in ggml's get_scale_min_k4.
++static __device__ __forceinline__ void q4_K_scale_min(const uint8_t * q, const int j, float & sc, float & mn) {
++    if (j < 4) {
++        sc = (float) (q[j] & 63);
++        mn = (float) (q[j + 4] & 63);
++    } else {
++        sc = (float) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
++        mn = (float) ((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
++    }
++}
++
++// Thread mapping: a lane owns one 16-byte chunk (32 weights, all in the same pair of sub-blocks) of one 256-weight block; a warp covers
++// 4 consecutive blocks per iteration. The 6-bit scale decode is therefore amortised over 32 weights, and each activation load is shared
++// by KEPLER_ROWS_PER_WARP rows.
++static __global__ void __launch_bounds__(32 * KEPLER_WARPS_PER_BLOCK) mul_mat_vec_q4_K_kepler(
++        const block_q4_K * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
++        const int nb, const int nrows, const int64_t stride_row,
++        const int32_t * __restrict__ ids, const int64_t stride_expert, const int64_t y_channel_stride, const int64_t dst_channel_stride) {
++    // blockIdx.y is the channel: for MUL_MAT_ID one selected expert (weights x + ids[c]*stride_expert), otherwise always 0.
++    const int channel = blockIdx.y;
++    if (ids) {
++        x += (int64_t) ids[channel] * stride_expert;
++    }
++    y   += channel * y_channel_stride;
++    dst += channel * dst_channel_stride;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int row0 = (blockIdx.x * KEPLER_WARPS_PER_BLOCK + warp) * KEPLER_ROWS_PER_WARP;
++    if (row0 >= nrows) {
++        return;
++    }
++    const block_q4_K * xr[KEPLER_ROWS_PER_WARP];
++#pragma unroll
++    for (int r = 0; r < KEPLER_ROWS_PER_WARP; ++r) {
++        xr[r] = x + (int64_t) min(row0 + r, nrows - 1) * stride_row;  // out-of-range rows re-read the last row; their result is dropped
++    }
++    const int bo   = lane >> 3;       // which of the 4 blocks of this iteration
++    const int c    = lane & 7;        // 16-byte chunk within the block's 128 quantized bytes
++    const int grp  = c >> 1;          // 64-weight group (0..3)
++    const int off  = (c & 1) * 16;    // 0 or 16: first weight of this lane within the group's 32 low (or high) weights
++
++    float acc[KEPLER_ROWS_PER_WARP] = {};
++#pragma unroll 1
++    for (int b0 = 0; b0 < nb; b0 += 4) {
++        const int b = b0 + bo;
++        if (b < nb) {
++            const float4 * ylo4 = (const float4 *) (y + 256 * b + 64 * grp + off);
++            const float4 * yhi4 = (const float4 *) (y + 256 * b + 64 * grp + 32 + off);
++            float ylo[16], yhi[16];
++            float sy_lo = 0.0f, sy_hi = 0.0f;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float4 a = __ldg(ylo4 + j);
++                const float4 h = __ldg(yhi4 + j);
++                sy_lo += (a.x + a.y) + (a.z + a.w);
++                sy_hi += (h.x + h.y) + (h.z + h.w);
++                // pre-scale by the inverse of each masked nibble's bit position (once for all rows)
++                ylo[4 * j + 0] = a.x;                    ylo[4 * j + 1] = a.y * (1.0f / 256.0f);
++                ylo[4 * j + 2] = a.z;                    ylo[4 * j + 3] = a.w * (1.0f / 256.0f);
++                yhi[4 * j + 0] = h.x * (1.0f / 16.0f);   yhi[4 * j + 1] = h.y * (1.0f / 4096.0f);
++                yhi[4 * j + 2] = h.z * (1.0f / 16.0f);   yhi[4 * j + 3] = h.w * (1.0f / 4096.0f);
++            }
++
++#pragma unroll
++            for (int r = 0; r < KEPLER_ROWS_PER_WARP; ++r) {
++                const block_q4_K * blk = xr[r] + b;
++                const float2 dm = __half22float2(blk->dm);
++                float sc_lo, mn_lo, sc_hi, mn_hi;
++                q4_K_scale_min(blk->scales, 2 * grp,     sc_lo, mn_lo);
++                q4_K_scale_min(blk->scales, 2 * grp + 1, sc_hi, mn_hi);
++
++                const uint4 wq = *(const uint4 *) (blk->qs + 32 * grp + off);  // 16 bytes = 16 low-nibble and 16 high-nibble weights
++                const uint32_t ww[4] = { wq.x, wq.y, wq.z, wq.w };
++                float pq_lo = 0.0f, pq_hi = 0.0f;
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    const uint32_t w01 = ww[j] & 0xFFFFu;   // bytes 0, 1 of this word
++                    const uint32_t w23 = ww[j] >> 16;       // bytes 2, 3 moved down so every masked value stays below 2^23
++                    pq_lo += nibble_to_float(w01 & 0x000Fu) * ylo[4 * j + 0] + nibble_to_float(w01 & 0x0F00u) * ylo[4 * j + 1]
++                           + nibble_to_float(w23 & 0x000Fu) * ylo[4 * j + 2] + nibble_to_float(w23 & 0x0F00u) * ylo[4 * j + 3];
++                    pq_hi += nibble_to_float(w01 & 0x00F0u) * yhi[4 * j + 0] + nibble_to_float(w01 & 0xF000u) * yhi[4 * j + 1]
++                           + nibble_to_float(w23 & 0x00F0u) * yhi[4 * j + 2] + nibble_to_float(w23 & 0xF000u) * yhi[4 * j + 3];
++                }
++                acc[r] += dm.x * (sc_lo * pq_lo + sc_hi * pq_hi) - dm.y * (mn_lo * sy_lo + mn_hi * sy_hi);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int r = 0; r < KEPLER_ROWS_PER_WARP; ++r) {
++        const float sum = warp_reduce_sum<32>(acc[r]);
++        if (lane == 0 && row0 + r < nrows) {
++            dst[row0 + r] = sum;
++        }
++    }
++}
++
++void ggml_cuda_mul_mat_vec_q4_K_kepler(
++        const void * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows, const int64_t stride_row,
++        const int32_t * ids, const int64_t n_channels, const int64_t stride_expert,
++        const int64_t y_channel_stride, const int64_t dst_channel_stride, cudaStream_t stream) {
++    GGML_ASSERT(ncols % QK_K == 0);
++    GGML_ASSERT(n_channels >= 1 && n_channels <= 65535);
++    const dim3 grid((nrows + KEPLER_ROWS_PER_BLOCK - 1) / KEPLER_ROWS_PER_BLOCK, (unsigned) n_channels);
++    const dim3 block(32 * KEPLER_WARPS_PER_BLOCK);
++    mul_mat_vec_q4_K_kepler<<<grid, block, 0, stream>>>(
++        (const block_q4_K *) x, y, dst, (int) (ncols / QK_K), (int) nrows, stride_row,
++        ids, stride_expert, y_channel_stride, dst_channel_stride);
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-kepler.cuh b/ggml/src/ggml-cuda/mmvq-kepler.cuh
+new file mode 100644
+index 0000000..9b3e4a2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-kepler.cuh
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "common.cuh"
++
++// Matrix-vector product for Q4_K weights and a float vector, for GPUs without dp4a (compute capability < 6.1, e.g. Kepler).
++// dst[row] = dot(x[row], y) for row in [0, nrows). `stride_row` is the row stride of x in blocks. ncols must be a multiple of 256.
++// Channels: with ids == nullptr there is one channel. With ids (MUL_MAT_ID, single token) channel c uses expert ids[c]: weights at
++// x + ids[c]*stride_expert (blocks), activations at y + c*y_channel_stride and output at dst + c*dst_channel_stride (floats).
++void ggml_cuda_mul_mat_vec_q4_K_kepler(
++    const void * x, const float * y, float * dst, int64_t ncols, int64_t nrows, int64_t stride_row,
++    const int32_t * ids, int64_t n_channels, int64_t stride_expert, int64_t y_channel_stride, int64_t dst_channel_stride,
++    cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 930f1ad..ba91de5 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-kepler.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -1548,6 +1549,26 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+     }
+ 
++    // Kepler/Maxwell (no dp4a, slow integer shifts): decode-time Q4_K matvec with float activations and no int8 quantization.
++    {
++        const int cc_kepler = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        if (cc_kepler < GGML_CUDA_CC_DP4A && src0->type == GGML_TYPE_Q4_K && !fusion && ne10 == ne00 && ne00 % QK_K == 0) {
++            const int64_t stride_row = src0->nb[1] / ts_src0;
++            if (!ids && ne11 == 1 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1) {
++                ggml_cuda_mul_mat_vec_q4_K_kepler(src0->data, src1_d, dst_d, ne00, ne01, stride_row, nullptr, 1, 0, 0, 0, stream);
++                return;
++            }
++            // MUL_MAT_ID with a single token: dst is [ne01, n_used], src1 is [ne10, 1 or n_used], ids is [n_used].
++            if (ids && ne2 == 1 && ne12 == 1 && ne3 == 1 && ids->ne[1] == 1 && ids->ne[0] == ne1 && (ne11 == 1 || ne11 == ne1)) {
++                const int64_t y_channel_stride   = ne11 == 1 ? 0 : src1->nb[1] / ts_src1;
++                const int64_t dst_channel_stride = dst->nb[1] / ts_dst;
++                ggml_cuda_mul_mat_vec_q4_K_kepler(src0->data, src1_d, dst_d, ne00, ne01, stride_row,
++                    ids_d, ne1, src0->nb[2] / ts_src0, y_channel_stride, dst_channel_stride, stream);
++                return;
++            }
++        }
++    }
++
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+     {
+-- 
+2.56.0
+
