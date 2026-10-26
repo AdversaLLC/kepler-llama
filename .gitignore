@@ -2,3 +2,4 @@
 *.gguf
 *.part
 build/
+graphify-out/
